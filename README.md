@@ -17,7 +17,7 @@ Someone can tell me how to do this on XTest maybe?
 
 Building
 
-$ cd src
+$ cd src\
 $ make
 
 
