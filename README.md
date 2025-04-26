@@ -11,12 +11,13 @@ For Linux Mint use System Settings (Preferences) > Keyboard > Shortcuts. For Com
 Dependencies
 
 libxdo\
-Tool to fake keyboard input. "Ctrl+Alt+V" only. You can delete it. 4 lines of code. But you will have to press it manually.
+Tool to fake keyboard input. "Ctrl+V" only. You can delete it. 4 lines of code. But you will have to press it manually.
 Someone can tell me how to do this on XTest maybe?
 
 
 Building
 
+$ cd src
 $ make
 
 
