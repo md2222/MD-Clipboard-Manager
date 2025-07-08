@@ -1,3 +1,5 @@
+// lite xml functions
+
 #ifndef __XMLFUNC_H__
 #define __XMLFUNC_H__
 
@@ -13,4 +15,3 @@ GList* xmlGetList(gchar* xml, gchar* listTag);
 gchar* xmlSetList(gchar* xml, GList* list, gchar* listName);
 
 #endif
-

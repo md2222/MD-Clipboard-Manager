@@ -1,5 +1,6 @@
 // release version
 #include <glib.h>
+#include <glib-unix.h>
 #include <gtk/gtk.h>
 #include <signal.h>
 #include <errno.h>
@@ -7,8 +8,10 @@
 #include <X11/Xlib.h>
 #include <X11/Intrinsic.h>
 #include <X11/extensions/XTest.h>
-
+#include "textlistwindow.h"
+#include "textfilefunc.h"
 #include "xmlfunc.h"
+#include "conffile.h"
 
 
 typedef struct 
@@ -19,27 +22,91 @@ typedef struct
 
 
 gchar* appName = "MD Clipboard Manager";
-//gchar* appName = "mdclip";
 GdkPixbuf *pixApp = 0;
 GdkPixbuf *pixOffline = 0;
 GtkStatusIcon *tray = 0;
-gchar *confPath = 0;
 
-enum AppMode { AM_PRIM, AM_REM };
+enum AppMode { APP_MODE_PRIMARY, APP_MODE_REMOTE };
 
 #define MAX_LIST_LEN 40
 #define MAX_LABEL_LEN 45
+#define MAX_LABEL_UTF8_LEN  MAX_LABEL_LEN * 4 + 1
 #define MAX_TOOLTIP_LEN 800
+#define MAX_TOOLTIP_UTF8_LEN MAX_TOOLTIP_LEN * 4 + 1
 static GtkClipboard *clip; 
 gchar *clipText;
 GList* clipList = 0;
 FILE* clipFile = 0;
 gchar* clipFilePath = 0;
+gint maxListLen = MAX_LIST_LEN;
+gint maxLabelLen = MAX_LABEL_LEN;
+gint maxTooltipLen = MAX_TOOLTIP_LEN;
 gboolean isOffline = FALSE;
 gint clipSigHandId = 0;
 int clipMenuItemCount = 0;
+int pinMenuItemCount = 0;
 Display* display = NULL;
+GList* pinList = 0;
+gchar* pinFilePath = 0;
+TextListWindow* pinListWIn = 0;
+GdkRectangle pinListWinRect = { 0, 0, 0, 0 };
+GdkRectangle pinEditorRect = { 0, 0, 0, 0 };
+gchar* confPath = 0;
+GKeyFile* confFile = 0;
 
+
+static void saveConfig()
+{
+    if (!confPath)
+    {
+        g_printerr("saveConfig:  Config file path is empty. Not saved.\n");
+        return;
+    }
+    
+    confFile = confOpen(confPath);
+
+    if (!confFile)
+        g_printerr("saveConfig:  Key file was not opened.\n");
+    else
+    {
+        confSetRect(confFile, "private", "pinListWinRect", &pinListWinRect);
+        confSetRect(confFile, "private", "pinEditorRect", &pinEditorRect);
+
+        confSetInt(confFile, "public", "maxListLen", maxListLen);
+        confSetInt(confFile, "public", "maxLabelLen", maxLabelLen);
+        confSetInt(confFile, "public", "maxTooltipLen", maxTooltipLen);
+
+        confSaveToFile(confFile, confPath);
+    }
+}
+
+
+static void loadConfig()
+{
+    if (!confPath)
+    {
+        g_printerr("loadConfig:  Config file path is empty. Not loaded.\n");
+        return;
+    }
+    
+    confFile = confOpen(confPath);
+
+    if (!confFile)
+    {
+        g_printerr("loadConfig:  Key file was not opened.\n");
+        return;
+    }
+ 
+    GdkRectangle rect = confGetRect(confFile, "private", "pinListWinRect");
+    if (!confRectIsEmpty(&rect))  pinListWinRect = rect;
+
+    rect = confGetRect(confFile, "private", "pinEditorRect");
+    if (!confRectIsEmpty(&rect))  pinEditorRect = rect;
+    
+    maxListLen = confGetInt(confFile, "public", "maxListLen", MAX_LIST_LEN);
+    maxLabelLen = confGetInt(confFile, "public", "maxLabelLen", MAX_LABEL_LEN);
+    maxTooltipLen = confGetInt(confFile, "public", "maxTooltipLen", MAX_TOOLTIP_LEN);
+}
 
 
 static void fakeKey(Display* disp, KeySym keysym, KeySym modsym)
@@ -81,7 +148,7 @@ static gboolean saveClipList()
         clipFile = fopen(clipFilePath, "w+");
         if (!clipFile) 
         {
-             fprintf(stderr, "saveClipList:  fopen error:  %d\n",  errno);
+             g_printerr("saveClipList:  fopen error:  %d\n",  errno);
              return FALSE;
         }
     }
@@ -101,13 +168,43 @@ static gboolean saveClipList()
     
     if (written != 1)
     {
-         fprintf(stderr, "saveClipList:  fwrite error:  %d\n",  errno);
+         g_printerr("saveClipList:  fwrite error:  %d\n",  errno);
          return FALSE;
     }
     
     fflush (clipFile); 
     
     return TRUE;
+}
+
+
+static void savePinList(gchar* path)
+{
+    FILE *file = fopen(path, "w+");
+    if (!file) 
+    {
+         g_printerr("savePinList:  fopen error:  %d\n",  errno);
+         return;
+    }
+        
+    gchar* tmp = g_strdup("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+
+    gchar* xml = xmlSetList(tmp, pinList, "pinned-list");
+    g_free(tmp);
+
+    int xmlSize = strlen(xml) + 1;
+
+    rewind(file);
+
+    size_t written = fwrite(xml, xmlSize, 1, file);
+    
+    if (written != 1)
+    {
+         g_printerr("savePinList:  fwrite error:  %d\n",  errno);
+         //return;
+    }
+    
+    fclose (file);
 }
 
 
@@ -153,6 +250,8 @@ static void onClipChanged()
 static void 
 onExit(GtkWidget *menuItem, GApplication *app)
 {
+    saveConfig();
+    
     gtk_main_quit();  // +onAppShutdown
 }
 
@@ -223,9 +322,17 @@ static gboolean onFakeKey(gpointer user_data)
 
 static void onClipMenuItem(GtkWidget *menuItem, int index)
 {
-    gchar* label = gtk_menu_item_get_label(menuItem);
-    
     gchar* itemText = g_list_nth_data (clipList, index);
+    
+    gtk_clipboard_set_text(clip, itemText, -1);
+    
+    g_timeout_add (500, onFakeKey, NULL);   // wait menu closed
+}
+
+
+static void onPinMenuItem(GtkWidget *menuItem, int index)
+{
+    gchar* itemText = g_list_nth_data (pinList, index);
     
     gtk_clipboard_set_text(clip, itemText, -1);
     
@@ -246,31 +353,76 @@ void replaceChar(char *str, char from, char to)
 }
 
 
-static void addClipMenuItem(gchar* item, GtkWidget *menu)
+static void onPinListWinClose(TextListWindow* tlw)
 {
-
-    gchar* label[100];
-    if (g_utf8_validate(item, -1, NULL))
-        g_utf8_strncpy(label, item, MAX_LABEL_LEN);
-    else
-        strncpy(label, item, MAX_LABEL_LEN);
-    replaceChar(label, '\n', ' ');
-    replaceChar(label, '\r', ' ');
-    replaceChar(label, '\t', ' ');
+    printf("onPinListWinClose:  \n");
     
-    GtkWidget *mi = gtk_menu_item_new_with_label(label);
+    pinListWinRect = tlw->rect;
+    pinEditorRect = tlw->editorRect;
     
-    if (strlen(item) > 100)
+    if (tlw->isChanged)
     {
-        gchar* tooltip =  g_strndup(item, MAX_TOOLTIP_LEN);    
-        gtk_widget_set_tooltip_text (mi, tooltip); 
-        g_free(tooltip);
+        GList* list = textListWindowGetList(tlw);
+        
+        g_list_free_full(pinList, g_free);
+        pinList = list;
+        
+        savePinList(pinFilePath);
+    }
+    
+    g_free(tlw);
+    pinListWIn = 0;
+} 
+
+
+static void onPinEdit(GtkMenuItem* self, gpointer user_data)
+{
+    pinListWIn = textListWindowShow(pinList, &pinListWinRect);
+    pinListWIn->editorRect = pinEditorRect;
+    pinListWIn->onClose = onPinListWinClose; 
+}
+
+
+static GtkWidget* createMenuItem(gchar* item)
+{
+    gboolean isUtf8 = g_utf8_validate(item, -1, NULL);
+    gchar* text = g_malloc(MAX_TOOLTIP_UTF8_LEN);
+    
+    if (isUtf8)  g_utf8_strncpy(text, item, MAX_LABEL_LEN);  // doc: The value is a NUL terminated UTF-8 string.
+    else  strncpy(text, item, MAX_LABEL_LEN);
+    
+    //replaceChar(text, '\n', ' ');  replaceChar(text, '\r', ' ');  replaceChar(text, '\t', ' ');
+    gchar* label = textToLine(text, -1);
+    GtkWidget *mi = gtk_menu_item_new_with_label(label);
+    g_free(label);
+    
+    int itemLen;
+    if (isUtf8)  itemLen = g_utf8_strlen(item, -1);
+    else  itemLen = strlen(item);
+    
+    if (itemLen > MAX_LABEL_LEN * 2)
+    {
+        if (isUtf8)  g_utf8_strncpy(text, item, MAX_TOOLTIP_LEN);
+        else  strncpy(text, item, MAX_TOOLTIP_LEN);
+
+        gtk_widget_set_tooltip_text (mi, text); 
     }
 
+    g_free(text);
+
+    return mi;
+}
+
+
+static void addClipMenuItem(gchar* item, GtkWidget *menu)
+{
+    GtkWidget *mi = createMenuItem(item);
+    
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
     g_signal_connect(mi, "activate", G_CALLBACK(onClipMenuItem), clipMenuItemCount);
     clipMenuItemCount++;
 }
+
 
 // for remote
 static void onClipMenuHide(GtkWidget *menu, gpointer user_data)
@@ -306,37 +458,78 @@ static gboolean onMenuTimeout (gpointer data)
 }
 
 
+static void addPinMenuItem(gchar* item, GtkWidget *menu)
+{
+    GtkWidget *mi = createMenuItem(item);
+    
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+    g_signal_connect(mi, "activate", G_CALLBACK(onPinMenuItem), pinMenuItemCount);  
+    pinMenuItemCount++;
+}
+
+
 void showClipMenu(int mode)
 {
     GtkWidget *clipMenu = gtk_menu_new();
 
-    if (mode == AM_REM)
+    if (mode == APP_MODE_REMOTE)
         g_signal_connect((GObject*)clipMenu, "hide", (GCallback)onClipMenuHide, NULL); 
 
+    GtkWidget *mi = 0;
     clipMenuItemCount = 0;
     
     if (clipList == NULL)
     {
-        GtkWidget *mi = gtk_menu_item_new_with_label("Empty");
+        mi = gtk_menu_item_new_with_label("Empty");
         gtk_widget_set_sensitive(mi, FALSE);
         gtk_menu_shell_append((GtkMenuShell*)clipMenu, mi);
     }
     else
         g_list_foreach (clipList, addClipMenuItem, clipMenu);
 
-    if (mode == AM_PRIM)
-    {
-        GtkWidget *sep = gtk_separator_menu_item_new();
-        gtk_menu_shell_append(GTK_MENU_SHELL(clipMenu), sep);
+    mi = gtk_separator_menu_item_new();
+    gtk_menu_shell_append(GTK_MENU_SHELL(clipMenu), mi);
+    
+    GtkWidget *pinMenu = gtk_menu_new();
 
-        GtkWidget *miClear = gtk_menu_item_new_with_label("Clear");
-        gtk_menu_shell_append(GTK_MENU_SHELL(clipMenu), miClear);
-        g_signal_connect(miClear, "activate", G_CALLBACK(onClear), NULL);
+    mi = gtk_menu_item_new_with_label("Pinned");
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(mi), pinMenu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(clipMenu), mi);
+
+    pinMenuItemCount = 0;
+
+    if (pinList == NULL)
+    {
+        mi = gtk_menu_item_new_with_label("Empty");
+        gtk_widget_set_sensitive(mi, FALSE);
+        gtk_menu_shell_append((GtkMenuShell*)pinMenu, mi);
+    }
+    else
+        g_list_foreach (pinList, addPinMenuItem, pinMenu);
+
+    mi = gtk_separator_menu_item_new();
+    gtk_menu_shell_append(GTK_MENU_SHELL(pinMenu), mi);
+
+    mi = gtk_menu_item_new_with_label("Edit");
+    gtk_menu_shell_append(GTK_MENU_SHELL(pinMenu), mi);
+    g_signal_connect(mi, "activate", G_CALLBACK(onPinEdit), NULL);
+    
+    
+    if (mode == APP_MODE_PRIMARY)
+    {
+        GtkWidget *clearMenu = gtk_menu_new();
+        mi = gtk_menu_item_new_with_label("Clear list");
+        gtk_menu_shell_append(GTK_MENU_SHELL(clearMenu), mi);
+        g_signal_connect(mi, "activate", G_CALLBACK(onClear), NULL);
+
+        mi = gtk_menu_item_new_with_label("Clear");
+        gtk_menu_item_set_submenu(GTK_MENU_ITEM(mi), clearMenu);
+        gtk_menu_shell_append(GTK_MENU_SHELL(clipMenu), mi);
     }
     
     gtk_widget_show_all(clipMenu);
     
-    if (mode == AM_REM)
+    if (mode == APP_MODE_REMOTE)
     {
         gtk_menu_popup((GtkMenu*)clipMenu, NULL, NULL, clipMenuPosFunc, NULL, 1, gtk_get_current_event_time());
         
@@ -351,7 +544,7 @@ void showClipMenu(int mode)
 
 static void onTrayActivate(GtkStatusIcon *status_icon, gpointer user_data)
 {
-    showClipMenu(AM_PRIM);
+    showClipMenu(APP_MODE_PRIMARY);
 }
 
 
@@ -370,55 +563,23 @@ onShutdownSignal(gpointer data)
 }
 
 
-gchar* dataFileReadAll(FILE* file)
-{
-    if(file == NULL) return NULL;
-    
-    fseek(file, 0 , SEEK_END); 
-    long size = ftell(file);   
-    
-    if (size == 0) return NULL;
-    
-    char *buf = (char*) malloc(sizeof(char) * size + 2); 
-    if (buf == NULL)
-    {
-        fprintf(stderr, "fileReadAll:  malloc error:  %d\n",  errno);
-        return NULL;
-    }
-
-    rewind (file);  
-
-    *buf = 0;
-    size_t result = fread(buf, 1, size, file); 
-    if (result != size)
-    {
-        fprintf(stderr, "fileReadAll:  fread error:  %d\n",  errno);
-        free(buf);
-        return NULL;
-    }
-    *(buf + size) = 0;
-
-    return buf;
-}
-
-
-gboolean readClipFile(gchar* path)
+gboolean loadClipList(gchar* path)
 {
     FILE * clipFile = fopen(path, "rb" );
 
     if (clipFile == NULL)
     {
-        fprintf(stderr, "readClipFile:  fopen error:  %d\n",  errno);
+        g_printerr("loadClipList:  fopen error:  %d\n",  errno);
         return FALSE;
     }
 
-    gchar* xml = dataFileReadAll(clipFile);
+    gchar* xml = fileReadAll(clipFile);
     
     if (!xml)
     {
         int err = ferror(clipFile);
         if (err)
-            fprintf(stderr, "readClipFile  dataFileReadAll error:  %d\n",  errno);
+            g_printerr("loadClipList:  dataFileReadAll error:  %d\n",  errno);
     }
     
     fclose (clipFile);
@@ -431,8 +592,33 @@ gboolean readClipFile(gchar* path)
     
         if (clipList == NULL)
         {
-            fprintf(stderr, "readClipFile  No list data in the file\n");
+            g_printerr("loadClipList:  No list data in the file\n");
             return FALSE;
+        }
+    }
+    
+    return TRUE;  
+}
+
+
+gboolean loadPinList(gchar* path)
+{
+    gchar* xml = textFileReadAll(path);
+    
+    if (!xml)
+    {
+        g_printerr("loadPinList:  textFileReadAll error:  %d\n",  errno);
+        if (errno != 2)  return FALSE;
+    }
+    else
+    {
+        pinList = xmlGetList(xml, "pinned-list");
+        g_free(xml);
+    
+        if (pinList == NULL)
+        {
+            g_printerr("loadPinList:  No list data in the file\n");
+            //return FALSE;
         }
     }
     
@@ -464,7 +650,7 @@ void onAppShutdown(GtkApplication *app)
 static void
 onAppActivate (GtkApplication *app, Args* args)
 {
-    g_print("mdclip 0.0.8      27.04.2025\n");
+    g_print("mdclip 0.1.3      7.07.2025\n");
     
     gchar *baseName = g_path_get_basename(args->argv[0]);
     gchar *configDir = g_build_path(G_DIR_SEPARATOR_S, g_get_user_config_dir(), baseName, NULL);
@@ -474,12 +660,13 @@ onAppActivate (GtkApplication *app, Args* args)
         if (g_mkdir_with_parents(configDir, 0755) != 0)
         {
             g_warning("Couldn't create config directory:  %s\n", configDir);
-            configDir = g_get_user_config_dir();
+            configDir = g_strdup(g_get_user_config_dir());
         }
     }
     
     confPath = g_build_path(G_DIR_SEPARATOR_S, configDir, g_strconcat(baseName, ".conf", NULL), NULL);
-    clipFilePath = g_strconcat(configDir, "/", baseName, ".xml", NULL);
+    clipFilePath = g_strconcat(configDir, "/clip.xml", NULL);
+    pinFilePath = g_strconcat(configDir, "/pin.xml", NULL);
 
     g_print("configDir=%s\n", configDir);
     
@@ -497,14 +684,16 @@ onAppActivate (GtkApplication *app, Args* args)
     
     if (args->argc > 1)
     {
-        g_print("appActivate:      arg=%s\n", args->argv[1]);
+        //g_print("appActivate: arg=%s\n", args->argv[1]);
         
         // if remote
         if (!strcmp(args->argv[1], "-m"))
         {
-            readClipFile(clipFilePath);
+            loadConfig();
+            loadClipList(clipFilePath);
+            loadPinList(pinFilePath);
             
-            showClipMenu(AM_REM);  
+            showClipMenu(APP_MODE_REMOTE);  
 
             gtk_main (); 
         }
@@ -531,8 +720,9 @@ onAppActivate (GtkApplication *app, Args* args)
     gtk_status_icon_set_visible(tray, TRUE);
     //gtk_status_icon_set_tooltip_text(tray, appName);
 
-    
-    readClipFile(clipFilePath);
+    loadConfig();
+    loadClipList(clipFilePath);
+    loadPinList(pinFilePath);
     
     gtk_main ();  // if no windows
 }
@@ -541,7 +731,7 @@ onAppActivate (GtkApplication *app, Args* args)
 int
 main (int argc, char **argv)
 {
-    g_print("main:   argc=%i\n", argc);
+    //g_print("main:   argc=%i\n", argc);
 
     GtkApplication *app;
     int status;
