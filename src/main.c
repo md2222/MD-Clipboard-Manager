@@ -26,7 +26,8 @@ GdkPixbuf *pixApp = 0;
 GdkPixbuf *pixOffline = 0;
 GtkStatusIcon *tray = 0;
 
-enum AppMode { APP_MODE_PRIMARY, APP_MODE_REMOTE };
+typedef enum { APP_MODE_PRIMARY, APP_MODE_REMOTE } AppMode;
+AppMode appMode = APP_MODE_PRIMARY;
 
 #define MAX_LIST_LEN 40
 #define MAX_LABEL_LEN 45
@@ -53,6 +54,8 @@ GdkRectangle pinListWinRect = { 0, 0, 0, 0 };
 GdkRectangle pinEditorRect = { 0, 0, 0, 0 };
 gchar* confPath = 0;
 GKeyFile* confFile = 0;
+
+static void showClipMenu();
 
 
 static void saveConfig()
@@ -259,7 +262,7 @@ onExit(GtkWidget *menuItem, GApplication *app)
 static void onOfflineToggled(GtkCheckMenuItem* self, gpointer user_data)
 {
     isOffline = gtk_check_menu_item_get_active (self);
-    g_print("onOfflineToggled:    %d\n", isOffline);
+    //g_print("onOfflineToggled:    %d\n", isOffline);
 
     if (isOffline)
     {
@@ -279,7 +282,7 @@ trayMenuNew (GtkApplication *app)
 {
     GtkWidget *trayMenu = gtk_menu_new();
 
-    gchar* helpTooltip = "For register system hotkey use \nSystem Settings (Preferences) > Keyboard > Shortcuts\n"
+    gchar* helpTooltip = "Delete  -  Delete selected item\n\nFor register system hotkey use \nSystem Settings (Preferences) > Keyboard > Shortcuts\n"
         "For Command use \"your-bin-dir/mdclip -m\"";
     
     GtkWidget *miHelp = gtk_menu_item_new_with_label("Help");
@@ -340,23 +343,8 @@ static void onPinMenuItem(GtkWidget *menuItem, int index)
 }
 
 
-void replaceChar(char *str, char from, char to) 
-{
-    char* pos = str;
-    
-    while (1) 
-    {
-        pos = strchr(pos, from);
-        if (pos == NULL)  break;
-        *pos++ = to;
-    }
-}
-
-
 static void onPinListWinClose(TextListWindow* tlw)
 {
-    printf("onPinListWinClose:  \n");
-    
     pinListWinRect = tlw->rect;
     pinEditorRect = tlw->editorRect;
     
@@ -391,7 +379,6 @@ static GtkWidget* createMenuItem(gchar* item)
     if (isUtf8)  g_utf8_strncpy(text, item, MAX_LABEL_LEN);  // doc: The value is a NUL terminated UTF-8 string.
     else  strncpy(text, item, MAX_LABEL_LEN);
     
-    //replaceChar(text, '\n', ' ');  replaceChar(text, '\r', ' ');  replaceChar(text, '\t', ' ');
     gchar* label = textToLine(text, -1);
     GtkWidget *mi = gtk_menu_item_new_with_label(label);
     g_free(label);
@@ -420,6 +407,7 @@ static void addClipMenuItem(gchar* item, GtkWidget *menu)
     
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
     g_signal_connect(mi, "activate", G_CALLBACK(onClipMenuItem), clipMenuItemCount);
+    g_object_set_data (G_OBJECT(mi), "listItem", item);
     clipMenuItemCount++;
 }
 
@@ -433,10 +421,21 @@ static void onClipMenuHide(GtkWidget *menu, gpointer user_data)
 
 void clipMenuPosFunc(GtkMenu* menu, gint* x, gint* y, gboolean* push_in, gpointer user_data)
 {
-    int height = gtk_widget_get_allocated_height (menu);
+    GdkRectangle menuRect;
+    gtk_widget_get_allocation (menu, &menuRect);
 
-    *x = gdk_screen_width () / 2;
-    *y = gdk_screen_height ()/2 - height/2;
+    GdkRectangle trayRect;
+    
+    if ( tray && gtk_status_icon_get_geometry (tray, NULL, &trayRect, NULL) )
+    {
+        *x = trayRect.x + trayRect.width - menuRect.width;
+        *y = trayRect.y;
+    }
+    else
+    {
+        *x = gdk_screen_width()/2;
+        *y = gdk_screen_height()/2 - menuRect.height/2;
+    }
 }
 
 
@@ -458,22 +457,46 @@ static gboolean onMenuTimeout (gpointer data)
 }
 
 
+static gboolean onClipMenuKeyPress(GtkWidget* widget, GdkEventKey* event, gpointer user_data)
+{
+    //if (event->state & GDK_SHIFT_MASK && event->keyval == GDK_KEY_Delete)
+    if (appMode == APP_MODE_PRIMARY && event->keyval == GDK_KEY_Delete)
+    {
+        GtkWidget* mi = gtk_menu_shell_get_selected_item (widget);
+
+        void* listItem = g_object_get_data (G_OBJECT(mi), "listItem");
+        clipList = g_list_remove (clipList, listItem);
+
+        saveClipList();
+
+        gtk_menu_shell_deactivate (widget);
+        showClipMenu();
+
+        return TRUE;
+    }
+    
+    return FALSE;
+}
+
+
 static void addPinMenuItem(gchar* item, GtkWidget *menu)
 {
     GtkWidget *mi = createMenuItem(item);
     
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
-    g_signal_connect(mi, "activate", G_CALLBACK(onPinMenuItem), pinMenuItemCount);  
+    g_signal_connect(mi, "activate", G_CALLBACK(onPinMenuItem), pinMenuItemCount);
     pinMenuItemCount++;
 }
 
 
-void showClipMenu(int mode)
+static void showClipMenu()
 {
     GtkWidget *clipMenu = gtk_menu_new();
 
-    if (mode == APP_MODE_REMOTE)
-        g_signal_connect((GObject*)clipMenu, "hide", (GCallback)onClipMenuHide, NULL); 
+    if (appMode == APP_MODE_REMOTE)
+        g_signal_connect((GObject*)clipMenu, "hide", (GCallback)onClipMenuHide, NULL);
+
+    g_signal_connect_after((GObject*)clipMenu, "key_press_event", G_CALLBACK(onClipMenuKeyPress), NULL);
 
     GtkWidget *mi = 0;
     clipMenuItemCount = 0;
@@ -515,7 +538,7 @@ void showClipMenu(int mode)
     g_signal_connect(mi, "activate", G_CALLBACK(onPinEdit), NULL);
     
     
-    if (mode == APP_MODE_PRIMARY)
+    if (appMode == APP_MODE_PRIMARY)
     {
         GtkWidget *clearMenu = gtk_menu_new();
         mi = gtk_menu_item_new_with_label("Clear list");
@@ -529,22 +552,17 @@ void showClipMenu(int mode)
     
     gtk_widget_show_all(clipMenu);
     
-    if (mode == APP_MODE_REMOTE)
-    {
-        gtk_menu_popup((GtkMenu*)clipMenu, NULL, NULL, clipMenuPosFunc, NULL, 1, gtk_get_current_event_time());
-        
+    gtk_menu_popup((GtkMenu*)clipMenu, NULL, NULL, clipMenuPosFunc, NULL, 1, gtk_get_current_event_time());
+
+    if (appMode == APP_MODE_REMOTE)
         // Some shortcuts show nothing. Need exit process.
         g_timeout_add (60 * G_TIME_SPAN_MILLISECOND, onMenuTimeout, NULL); 
-    }
-    else
-        gtk_menu_popup((GtkMenu*)clipMenu, NULL, tray, NULL, NULL, 1, gtk_get_current_event_time());
-        
 }
 
 
 static void onTrayActivate(GtkStatusIcon *status_icon, gpointer user_data)
 {
-    showClipMenu(APP_MODE_PRIMARY);
+    showClipMenu();
 }
 
 
@@ -647,10 +665,9 @@ void onAppShutdown(GtkApplication *app)
 }
 
 
-static void
-onAppActivate (GtkApplication *app, Args* args)
+static void onAppActivate (GtkApplication *app, Args* args)
 {
-    g_print("mdclip 0.1.3      7.07.2025\n");
+    g_print("mdclip 0.1.5      20.07.2025\n");
     
     gchar *baseName = g_path_get_basename(args->argv[0]);
     gchar *configDir = g_build_path(G_DIR_SEPARATOR_S, g_get_user_config_dir(), baseName, NULL);
@@ -684,16 +701,16 @@ onAppActivate (GtkApplication *app, Args* args)
     
     if (args->argc > 1)
     {
-        //g_print("appActivate: arg=%s\n", args->argv[1]);
-        
         // if remote
         if (!strcmp(args->argv[1], "-m"))
         {
+            appMode = APP_MODE_REMOTE;
+            
             loadConfig();
             loadClipList(clipFilePath);
             loadPinList(pinFilePath);
             
-            showClipMenu(APP_MODE_REMOTE);  
+            showClipMenu();  
 
             gtk_main (); 
         }
@@ -731,8 +748,6 @@ onAppActivate (GtkApplication *app, Args* args)
 int
 main (int argc, char **argv)
 {
-    //g_print("main:   argc=%i\n", argc);
-
     GtkApplication *app;
     int status;
 
